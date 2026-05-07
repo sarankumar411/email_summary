@@ -1,0 +1,66 @@
+services:
+  api:
+    build: .
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m celery -A app.workers.celery_app:celery_app worker --loglevel=INFO
+    env_file: .env
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build: .
+    command: python -m celery -A app.workers.celery_app:celery_app beat --loglevel=INFO
+    env_file: .env
+    volumes:
+      - .:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: email_context
+      POSTGRES_PASSWORD: email_context
+      POSTGRES_DB: email_context
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U email_context -d email_context"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass email_context
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "email_context", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
