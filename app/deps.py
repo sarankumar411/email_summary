@@ -34,6 +34,23 @@ WriteDb = Annotated[AsyncSession, Depends(get_write_db)]
 async def get_token_payload(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
 ) -> dict:
+    """Extract and validate the Bearer token; check the Redis JTI blocklist for revocation.
+
+    Steps:
+        1. If the Authorization header is absent → 401 Missing bearer token.
+        2. Decode and verify the JWT signature + expiry → 401 Invalid bearer token on failure.
+        3. If the token's jti is present in Redis "auth:blocklist:{jti}" → 401 Token revoked.
+           (Redis errors are silently ignored; a Redis outage should not block all API access.)
+
+    Returns the raw JWT payload dict on success.
+
+    Dry run (valid, non-revoked token):
+        → {"sub": "acc-1", "firm_id": "f-1", "role": "admin", "jti": "...", "exp": ...}
+    Dry run (expired or tampered token):
+        → raises HTTP 401
+    Dry run (token in blocklist after logout):
+        → raises HTTP 401 "Token has been revoked"
+    """
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
     try:
@@ -58,6 +75,18 @@ async def get_current_user(
     payload: Annotated[dict, Depends(get_token_payload)],
     session: ReadDb,
 ) -> AuthenticatedUser:
+    """Load the active accountant from the DB using the sub claim from the verified JWT.
+
+    Depends on get_token_payload (JWT already verified and blocklist-checked by the time
+    this runs). Converts the sub string claim to a UUID and fetches the accountant from the
+    read replica. Returns None (→ 401) if the account has been deactivated since the token
+    was issued — the JWT alone is not enough; the DB is the source of truth for is_active.
+
+    Dry run (valid JWT, active account):
+        payload.sub="acc-1" → AuthenticatedUser(id=UUID("acc-1"), role="admin", is_active=True)
+    Dry run (account deactivated after token issue):
+        → raises HTTP 401 "Inactive account"
+    """
     try:
         accountant_id = uuid.UUID(str(payload["sub"]))
     except (KeyError, ValueError) as exc:
@@ -85,12 +114,26 @@ def get_clients_read_service(session: ReadDb) -> ClientsService:
 
 
 async def require_admin(current_user: CurrentUser) -> AuthenticatedUser:
+    """Guard dependency: raise 403 unless the caller holds admin or superuser role.
+
+    Used on endpoints that manage assignments and accountants at the firm level.
+
+    Dry run (role="admin")     → passes through, returns current_user.
+    Dry run (role="accountant") → raises HTTP 403 "Admin role required".
+    """
     if current_user.role not in {"admin", "superuser"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
     return current_user
 
 
 async def require_superuser(current_user: CurrentUser) -> AuthenticatedUser:
+    """Guard dependency: raise 403 unless the caller is a superuser.
+
+    Used exclusively on the global report endpoint, which spans all firms.
+
+    Dry run (role="superuser") → passes through, returns current_user.
+    Dry run (role="admin")     → raises HTTP 403 "Superuser role required".
+    """
     if current_user.role != "superuser":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superuser role required")
     return current_user

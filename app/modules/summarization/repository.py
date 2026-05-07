@@ -14,6 +14,15 @@ class SummarizationRepository:
         self.session = session
 
     async def get_summary_by_client(self, client_id: uuid.UUID) -> EmailSummary | None:
+        """Fetch the encrypted summary row for a client, or None if no refresh has run yet.
+
+        Query:
+            SELECT * FROM email_summaries WHERE client_id = :client_id
+
+        Dry run:
+            client_id = UUID("a1b2-...") → EmailSummary(emails_analyzed_count=12, ...)
+            client_id = UUID("new-...")  → None  (first-time client, no summary yet)
+        """
         result = await self.session.execute(
             select(EmailSummary).where(EmailSummary.client_id == client_id)
         )
@@ -31,6 +40,23 @@ class SummarizationRepository:
         last_refreshed_at: datetime,
         gemini_model_version: str,
     ) -> EmailSummary:
+        """Insert a new summary row or overwrite every mutable column of the existing one.
+
+        Logic:
+            1. SELECT the row by client_id (one extra read per refresh, acceptable given
+               refresh is a low-frequency write path).
+            2. Missing → INSERT a fresh EmailSummary and flush to obtain the server UUID.
+            3. Present → mutate fields in-place; SQLAlchemy's unit-of-work emits an UPDATE
+               on flush without needing an explicit UPDATE statement.
+
+        Session.commit() is intentionally left to the caller (SummarizationService) so the
+        upsert and the audit-log INSERT share a single atomic transaction.
+
+        Dry run (first refresh):
+            client_id=UUID("cli-1") not found → INSERT, returns EmailSummary(id=UUID("new-uuid")).
+        Dry run (re-refresh):
+            existing row found → overwrite payload, nonce, count=15, returns same id.
+        """
         summary = await self.get_summary_by_client(client_id)
         if summary is None:
             summary = EmailSummary(
@@ -66,6 +92,22 @@ class SummarizationRepository:
         status: RefreshAuditStatus,
         error_message: str | None = None,
     ) -> RefreshAuditLog:
+        """Append one row to refresh_audit_log for every refresh attempt.
+
+        Called unconditionally — for successes, skips, and hard failures — so the audit
+        trail is complete regardless of outcome. summary_id is nullable because a failure
+        before the first upsert means no EmailSummary row exists yet.
+
+        Dry run (success):
+            status=RefreshAuditStatus.success, emails_processed=15, duration_ms=1240
+            → inserts row; error_message=None.
+        Dry run (skip, no new emails):
+            status=RefreshAuditStatus.skipped_no_new_emails, emails_processed=0
+            → inserts row; duration_ms reflects the advisory-lock + count-check time only.
+        Dry run (failure):
+            status=RefreshAuditStatus.failed, error_message="gemini unavailable"
+            → inserts row; summary_id=None if failure occurred before first upsert.
+        """
         row = RefreshAuditLog(
             summary_id=summary_id,
             client_id=client_id,
@@ -80,6 +122,25 @@ class SummarizationRepository:
         return row
 
     async def firm_report(self, firm_id: uuid.UUID) -> tuple[int, int, datetime | None]:
+        """Aggregate summary statistics for a single firm in one DB round-trip.
+
+        Query:
+            SELECT count(client_id),
+                   coalesce(sum(emails_analyzed_count), 0),
+                   max(last_refreshed_at)
+            FROM email_summaries
+            WHERE firm_id = :firm_id
+
+        Returns (clients_with_summaries, total_emails_analyzed, last_activity).
+        coalesce ensures sum returns 0 instead of NULL when no rows match.
+
+        Dry run:
+            firm_id = UUID("firm-1")
+            → (3, 47, datetime(2025, 3, 20, 14, 0, tzinfo=UTC))
+              3 clients summarised, 47 emails total, last refresh on 20 Mar 2025.
+        Dry run (firm with no summaries yet):
+            → (0, 0, None)
+        """
         result = await self.session.execute(
             select(
                 func.count(EmailSummary.client_id),
@@ -94,6 +155,29 @@ class SummarizationRepository:
         self,
         firm_ids: list[uuid.UUID],
     ) -> dict[uuid.UUID, tuple[int, int, datetime | None]]:
+        """Batch aggregation for multiple firms in a single query (used by the global report).
+
+        Query:
+            SELECT firm_id,
+                   count(client_id),
+                   coalesce(sum(emails_analyzed_count), 0),
+                   max(last_refreshed_at)
+            FROM email_summaries
+            WHERE firm_id IN (:firm_ids)
+            GROUP BY firm_id
+
+        Firms that have no summary rows are absent from the result dict entirely.
+        Callers should use .get(firm_id, (0, 0, None)) to handle the missing-firm case.
+        Early-returns an empty dict when firm_ids is empty to avoid a vacuous IN () query.
+
+        Dry run:
+            firm_ids = [UUID("aaa"), UUID("bbb"), UUID("ccc")]
+            → {
+                UUID("aaa"): (2, 30, datetime(2025-03-18, ...)),
+                UUID("bbb"): (1,  5, datetime(2025-03-01, ...)),
+                # UUID("ccc") has no summaries — absent from the dict
+              }
+        """
         if not firm_ids:
             return {}
 

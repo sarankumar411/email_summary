@@ -34,6 +34,25 @@ class ReportingService:
         current_user: AuthenticatedUser,
         firm_id: uuid.UUID | None = None,
     ) -> FirmReportResponse:
+        """Return aggregated summary statistics for one firm, served from a 60-second Redis cache.
+
+        Firm resolution:
+            - admin      : always uses current_user.firm_id (ignores firm_id param).
+            - superuser  : uses the provided firm_id query param; raises BusinessRuleError
+                           if it was not supplied (the endpoint validates this upstream, but
+                           the service enforces it defensively).
+
+        Cache key: "report:firm:{firm_id}" — TTL 60 s (short because totals change on refresh).
+        Cache miss: runs a single aggregate query via SummaryStatsService and warms the cache.
+        Redis errors are silently swallowed in both get and set paths.
+
+        Dry run (admin for their own firm):
+            current_user.role="admin", current_user.firm_id=UUID("f-1")
+            → FirmReportResponse(firm_id=UUID("f-1"), clients_with_summaries=3,
+                                 total_emails_analyzed=47, last_activity=datetime(...))
+        Dry run (superuser, firm_id=None):
+            → raises BusinessRuleError("firm_id is required for superuser firm report")
+        """
         resolved_firm_id = firm_id if current_user.role == "superuser" else current_user.firm_id
         if resolved_firm_id is None:
             raise BusinessRuleError("firm_id is required for superuser firm report")
@@ -55,6 +74,27 @@ class ReportingService:
         return response
 
     async def global_report(self, *, page: int, page_size: int) -> GlobalReportResponse:
+        """Return a paginated per-firm breakdown for the superuser, served from a 60-second cache.
+
+        Cache key: "report:global:page:{page}:size:{page_size}"
+        Cache miss logic:
+            1. COUNT total firms (for pagination metadata).
+            2. SELECT firms for the requested page, sorted by name ASC.
+            3. Batch-aggregate summary stats for the page's firms in one query.
+            4. Join firms with their stats via .get(firm_id, (0, 0, None)) — firms without
+               any summaries fall back to (0, 0, None).
+            5. Write result to Redis and return.
+
+        Dry run (3 firms, page=1, page_size=25):
+            → GlobalReportResponse(
+                items=[
+                  GlobalReportItem(firm_name="Alpha CPA", clients_with_summaries=2, ...),
+                  GlobalReportItem(firm_name="Beta Partners", clients_with_summaries=0, ...),
+                  GlobalReportItem(firm_name="Gamma LLC", clients_with_summaries=1, ...),
+                ],
+                page=1, page_size=25, total=3
+              )
+        """
         cache_key = f"report:global:page:{page}:size:{page_size}"
         cached = await self._get_cached(cache_key)
         if cached is not None:
@@ -82,6 +122,11 @@ class ReportingService:
         return response
 
     async def _get_cached(self, key: str) -> dict | None:
+        """Try to fetch a cached dict from Redis; return None on miss or Redis error.
+
+        isinstance check guards against a cached list accidentally being returned as a dict.
+        RedisError is swallowed so a Redis outage degrades to an uncached read, not a 503.
+        """
         try:
             value = await self.cache.get_json(key)
         except RedisError:
@@ -89,6 +134,7 @@ class ReportingService:
         return value if isinstance(value, dict) else None
 
     async def _set_cached(self, key: str, value: dict) -> None:
+        """Serialise and write a dict to Redis with the report TTL (60 s). Silently ignores errors."""
         try:
             await self.cache.set_json(key, value, self.settings.cache_report_ttl_seconds)
         except RedisError:

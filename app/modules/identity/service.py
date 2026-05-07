@@ -28,6 +28,25 @@ class IdentityService:
         self.repository = IdentityRepository(session)
 
     async def authenticate(self, email: str, password: str) -> tuple[str, int]:
+        """Verify credentials and return a signed JWT token with its lifetime in seconds.
+
+        Logic:
+            1. Look up accountant by email (lower-cased at DB level).
+            2. Raise AuthorizationError if the account does not exist or is inactive —
+               both cases return the same error to prevent user enumeration.
+            3. Verify the plaintext password against the stored bcrypt hash.
+            4. Issue a JWT with claims: sub=accountant.id, firm_id, role, iat, exp, jti.
+
+        Returns (access_token: str, expires_in: int) where expires_in is seconds.
+
+        Dry run (valid credentials):
+            email="priya@cpafirm.com", password="correct-password"
+            → ("eyJ...", 3600)
+        Dry run (wrong password or unknown email):
+            → raises AuthorizationError("Invalid credentials")
+        Dry run (inactive account):
+            → raises AuthorizationError("Invalid credentials")  (same message, no leakage)
+        """
         accountant = await self.repository.get_accountant_by_email(email)
         if accountant is None or not accountant.is_active:
             raise AuthorizationError("Invalid credentials")
@@ -72,6 +91,26 @@ class IdentityService:
         payload: AccountantUpdateRequest,
         current_user: AuthenticatedUser,
     ) -> Accountant:
+        """Patch full_name and/or is_active on an accountant; enforces ownership and role rules.
+
+        Authorization rules (enumeration-resistant — all violations raise NotFoundError):
+            - accountant : can only edit their own profile (current_user.id == target.id).
+            - admin      : can edit any accountant within their own firm only.
+            - superuser  : can edit anyone (no additional check).
+
+        Additional rule: only admins and superusers may change is_active.
+        A regular accountant attempting to set is_active raises AuthorizationError (403),
+        which is intentional — we want the caller to know they lack the role, not that the
+        record doesn't exist.
+
+        Dry run (accountant editing own name):
+            accountant_id=current_user.id, payload.full_name="Priya K.", payload.is_active=None
+            → returns updated Accountant with full_name="Priya K.".
+        Dry run (admin deactivating a cross-firm accountant):
+            → raises NotFoundError (enumeration resistance).
+        Dry run (accountant trying to set is_active=False on self):
+            → raises AuthorizationError("Only admins can change active status").
+        """
         target = await self.repository.get_accountant_by_id(accountant_id)
         if target is None:
             raise NotFoundError("Accountant not found")
@@ -92,6 +131,15 @@ class IdentityService:
         return updated
 
     def _to_context(self, accountant: Accountant) -> AuthenticatedUser:
+        """Convert a SQLAlchemy Accountant ORM object to a module-safe AuthenticatedUser dataclass.
+
+        The AuthenticatedUser dataclass is used throughout the service and dependency layers
+        so that modules never hold a reference to the raw ORM model (which is tied to a session).
+
+        Dry run:
+            accountant.id=UUID("acc-1"), accountant.role=Role.admin
+            → AuthenticatedUser(id=UUID("acc-1"), role="admin", is_active=True, ...)
+        """
         return AuthenticatedUser(
             id=accountant.id,
             firm_id=accountant.firm_id,

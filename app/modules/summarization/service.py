@@ -50,6 +50,25 @@ class SummarizationService:
         self.settings = settings or get_settings()
 
     async def get_summary(self, client_id: uuid.UUID) -> SummaryResponse:
+        """Return the decrypted summary DTO for a client, serving from Redis cache when available.
+
+        Read path (cache-aside pattern):
+            1. Check Redis for key "summary:client:{client_id}" (TTL 1 h).
+            2. Cache hit → deserialise the JSON DTO and return immediately (CACHE_HITS_TOTAL++).
+            3. Cache miss → read from the DB read-replica, decrypt the AES-GCM payload,
+               build the SummaryResponse, warm the cache for future reads, and return.
+               (CACHE_MISSES_TOTAL++)
+            4. Redis errors are silently swallowed — the DB is always the fallback.
+
+        Raises NotFoundError if no summary row exists yet (maps to 404 at the router layer).
+
+        Dry run (cache hit):
+            Redis has "summary:client:UUID-1" → SummaryResponse returned in ~1 ms.
+        Dry run (cache miss, DB has row):
+            → decrypt bytes, return SummaryResponse(actors=[...], open_action_items=[...]).
+        Dry run (no summary row):
+            → raises NotFoundError → 404.
+        """
         cache_key = self._summary_cache_key(client_id)
         try:
             cached = await self.cache.get_json(cache_key)
@@ -87,6 +106,39 @@ class SummarizationService:
         triggered_by_accountant_id: uuid.UUID,
         force: bool,
     ) -> dict:
+        """Run the full summarisation pipeline for a client (executed inside the Celery worker).
+
+        Pipeline steps:
+            1.  Mark job 'running' and commit (so GET /jobs/{id} reflects progress).
+            2.  Acquire a Postgres advisory lock on "summary:{client_id}" to prevent
+                concurrent refreshes for the same client racing each other.
+            3.  Fetch current email count from MockEmailService (or a real provider).
+            4.  Compare count to email_summaries.emails_analyzed_count:
+                    - Equal AND not force → skip; write 'skipped_no_new_emails' audit row
+                      and mark job 'skipped'. No Gemini call made.
+            5.  Fetch all emails (list[EmailMessage]) and run map-reduce summarisation.
+            6.  Validate the Gemini output against GeminiSummarySchema (Pydantic).
+            7.  Encrypt the validated JSON payload with AES-256-GCM.
+            8.  Upsert the email_summaries row and append to refresh_audit_log — both
+                inside a single transaction (single commit).
+            9.  Write the decrypted SummaryResponse to Redis cache (TTL 1 h).
+            10. Mark job 'completed'.
+
+        On any exception: rollback the main transaction, attempt to write a 'failed'
+        audit row (best-effort, separate transaction), update job status to 'failed',
+        and re-raise so the Celery task registers as failed.
+
+        job_id may be None when called outside a job context (e.g., direct service tests).
+
+        Dry run (new emails available, force=False):
+            email_count=15, existing.emails_analyzed_count=10
+            → runs pipeline, returns {"status":"completed","client_id":"...","summary_id":"..."}
+        Dry run (no new emails, force=False):
+            email_count=10, existing.emails_analyzed_count=10
+            → returns {"status":"skipped_no_new_emails","client_id":"..."}
+        Dry run (no new emails, force=True):
+            → bypasses count check, runs full pipeline regardless.
+        """
         start = perf_counter()
         existing_summary_id: uuid.UUID | None = None
         emails_processed = 0
@@ -216,6 +268,23 @@ class SummarizationService:
         return await self.repository.firm_reports(firm_ids)
 
     async def _summarize_with_map_reduce(self, emails: list) -> GeminiSummarySchema:
+        """Summarise emails using a single call or a map-reduce strategy for large sets.
+
+        Strategy:
+            - len(emails) <= CHUNK_THRESHOLD (default 50):
+                Single call: summarize_emails(all_emails) → GeminiSummarySchema.
+            - len(emails) > CHUNK_THRESHOLD:
+                Map phase  : split into sorted chunks of CHUNK_THRESHOLD; one Gemini call
+                             per chunk, producing a list of partial GeminiSummarySchemas.
+                Reduce phase: feed all partials into merge_summaries(), which either calls
+                             Gemini with the REDUCE_PROMPT (real mode) or merges locally
+                             with deduplication (mock mode).
+
+        Dry run (12 emails, threshold=50):
+            → 1 Gemini call, direct result returned.
+        Dry run (120 emails, threshold=50):
+            → 3 map calls (emails[0:50], [50:100], [100:120]) + 1 reduce call → merged result.
+        """
         threshold = self.settings.summary_chunk_threshold
         if len(emails) <= threshold:
             return await self.gemini_client.summarize_emails(emails)
@@ -226,6 +295,20 @@ class SummarizationService:
         return await self.gemini_client.merge_summaries(partials)
 
     async def _acquire_advisory_lock(self, client_id: uuid.UUID) -> None:
+        """Acquire a Postgres advisory transaction lock scoped to this client's summary.
+
+        Uses pg_advisory_xact_lock, which is automatically released when the current
+        transaction ends (commit or rollback). This prevents two concurrent Celery workers
+        from refreshing the same client simultaneously and producing a duplicate write race.
+
+        hashtext() converts the string key to an integer; advisory locks are keyed by int.
+        The lock is a no-op outside Postgres (e.g., SQLite in unit tests) — the dialect
+        check skips the statement for non-Postgres engines.
+
+        Dry run (client_id=UUID("cli-1")):
+            Executes: SELECT pg_advisory_xact_lock(hashtext('summary:cli-1'))
+            → blocks until acquired (instantaneous when no concurrent worker holds it).
+        """
         bind = self.session.get_bind()
         if bind.dialect.name != "postgresql":
             return
@@ -235,6 +318,19 @@ class SummarizationService:
         )
 
     async def _cache_summary(self, response: SummaryResponse) -> None:
+        """Write a serialised SummaryResponse to Redis with a 1-hour TTL.
+
+        The decrypted DTO is cached so GET /clients/{id}/summary can be served from Redis
+        without hitting the DB or decrypting the payload on every read.
+        Redis errors are silently swallowed — a missing cache entry is tolerable because the
+        DB is always the authoritative source.
+
+        Cache key: "summary:client:{client_id}"
+
+        Dry run:
+            response.client_id=UUID("cli-1")
+            → SET "summary:client:cli-1" <json> EX 3600
+        """
         try:
             await self.cache.set_json(
                 self._summary_cache_key(response.client_id),
@@ -245,27 +341,47 @@ class SummarizationService:
             return
 
     def _summary_cache_key(self, client_id: uuid.UUID) -> str:
+        """Build the Redis cache key for a client's summary. Format: "summary:client:{uuid}"."""
         return f"summary:client:{client_id}"
 
     def _elapsed_ms(self, start: float) -> int:
+        """Return elapsed wall-clock time in milliseconds since a perf_counter() start point."""
         return int((perf_counter() - start) * 1000)
 
 
 class SummaryStatsService:
-    """Read-only summary statistics exposed to reporting."""
+    """Read-only summary statistics exposed to the reporting module.
+
+    This thin facade exists so the reporting module never imports SummarizationRepository
+    directly (which would violate the no-cross-module-repository-import rule). ReportingService
+    depends on SummaryStatsService, not on the summarization repository or ORM models.
+    """
 
     def __init__(self, session: AsyncSession) -> None:
         self.repository = SummarizationRepository(session)
 
     async def firm_summary_totals(self, firm_id: uuid.UUID) -> tuple[int, int, datetime | None]:
-        """Return summary totals for one firm."""
+        """Return (clients_with_summaries, total_emails_analyzed, last_activity) for one firm.
 
+        Delegates to the repository's single-firm aggregate query.
+
+        Dry run:
+            firm_id=UUID("f-1") → (3, 47, datetime(2025-03-20, 14:00, UTC))
+        """
         return await self.repository.firm_report(firm_id)
 
     async def summary_totals_by_firm(
         self,
         firm_ids: list[uuid.UUID],
     ) -> dict[uuid.UUID, tuple[int, int, datetime | None]]:
-        """Return summary totals keyed by firm id."""
+        """Return a dict of per-firm totals for a batch of firm IDs (used by the global report).
 
+        Delegates to the repository's multi-firm aggregate query (single DB round-trip).
+        Firms with no summaries are absent from the returned dict; callers use
+        .get(firm_id, (0, 0, None)) as the fallback.
+
+        Dry run:
+            firm_ids=[UUID("f-1"), UUID("f-2")]
+            → {UUID("f-1"): (3, 47, datetime(...)), UUID("f-2"): (1, 5, datetime(...))}
+        """
         return await self.repository.firm_reports(firm_ids)
